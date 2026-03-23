@@ -15,7 +15,7 @@
 
 """Timing utilities for benchmarking SOL ExecBench kernel solutions.
 
-Uses CUDA events for L2-cache-cleared, warmed-up timing.
+Uses GPU events (CUDA or XPU) for L2-cache-cleared, warmed-up timing.
 Derived from triton.testing.do_bench (MIT licence); argument cloning and
 synchronization follow sol-bench conventions for accurate measurements.
 """
@@ -168,9 +168,11 @@ def do_bench(
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
+    from .device_compat import create_events, gpu_synchronize
+
     cache = _get_empty_cache_for_benchmark(device)
-    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
-    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
+    start_events = create_events(rep, device)
+    end_events = create_events(rep, device)
 
     # Pin all setup results so CPython cannot recycle their id() values.
     # Without this, adversarial code can cache results keyed on tensor id()
@@ -196,7 +198,7 @@ def do_bench(
             fn(args)
         else:
             fn()
-    torch.cuda.synchronize()
+    gpu_synchronize(device)
 
     # Timed iterations
     for i in range(rep):
@@ -206,16 +208,16 @@ def do_bench(
         _clear_cache(cache)
         if setup is not None:
             args = _get_args()
-            torch.cuda.synchronize()
+            gpu_synchronize(device)
             start_events[i].record()
             fn(args)
         else:
-            torch.cuda.synchronize()
+            gpu_synchronize(device)
             start_events[i].record()
             fn()
         end_events[i].record()
 
-    torch.cuda.synchronize()
+    gpu_synchronize(device)
     del _pinned
     times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
     return _summarize_statistics(times, quantiles, return_mode)
@@ -253,7 +255,9 @@ def time_runnable(
     float
         Mean execution time in milliseconds.
     """
-    with torch.cuda.device(device):
+    from .device_compat import device_context
+
+    with device_context(device):
         return do_bench(
             fn=lambda prepared_args: fn(*prepared_args),
             warmup=warmup,

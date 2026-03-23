@@ -31,11 +31,32 @@ def is_cuda_available() -> bool:
     return torch.cuda.is_available()
 
 
+def is_xpu_available() -> bool:
+    import torch
+
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
+def is_accelerator_available() -> bool:
+    import torch.accelerator as acc
+
+    return acc.is_available()
+
+
 def list_cuda_devices() -> List[str]:
     import torch
 
     n = torch.cuda.device_count()
     return [f"cuda:{i}" for i in range(n)]
+
+
+def list_xpu_devices() -> List[str]:
+    import torch
+
+    if not hasattr(torch, "xpu"):
+        return []
+    n = torch.xpu.device_count()
+    return [f"xpu:{i}" for i in range(n)]
 
 
 def env_snapshot(device: str) -> "Environment":

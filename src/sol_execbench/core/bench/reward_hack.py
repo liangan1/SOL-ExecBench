@@ -16,7 +16,7 @@
 """Reward hack defenses for SOL ExecBench evaluation.
 
 Provides detection functions for five common reward-hacking patterns.
-The identity of torch.cuda.Event.elapsed_time is captured at module load
+The identity of the GPU Event.elapsed_time function is captured at module load
 time — before any user code is imported — so patching after the fact is
 detected.
 """
@@ -31,13 +31,12 @@ import torch
 # ---------------------------------------------------------------------------
 # Capture timing function identity at module load, before any user code runs.
 # Used by check_monkey_patch() to detect post-import patching.
+# We capture torch.Event.elapsed_time (the unified API).
 # ---------------------------------------------------------------------------
 _ELAPSED_TIME_ADDR: int | None = None
 
 try:
-    import torch.cuda as _tc_init
-
-    _ELAPSED_TIME_ADDR = id(_tc_init.Event.elapsed_time)
+    _ELAPSED_TIME_ADDR = id(torch.Event.elapsed_time)
 except Exception:
     pass
 
@@ -47,7 +46,7 @@ class RewardHackDetected(RuntimeError):
 
 
 def check_monkey_patch() -> None:
-    """Detect if torch.cuda.Event.elapsed_time has been patched.
+    """Detect if torch.Event.elapsed_time has been patched.
 
     Compares the current function identity against the address captured at
     module load time.  Must be called before the timed section.
@@ -56,14 +55,12 @@ def check_monkey_patch() -> None:
         RewardHackDetected: If the timing function has been replaced.
     """
     try:
-        import torch.cuda as _tc
-
         if (
             _ELAPSED_TIME_ADDR is not None
-            and id(_tc.Event.elapsed_time) != _ELAPSED_TIME_ADDR
+            and id(torch.Event.elapsed_time) != _ELAPSED_TIME_ADDR
         ):
             raise RewardHackDetected(
-                "torch.cuda.Event.elapsed_time has been monkey-patched"
+                "torch.Event.elapsed_time has been monkey-patched"
             )
     except RewardHackDetected:
         raise
@@ -128,12 +125,14 @@ def check_stream_injection(
     Raises:
         RewardHackDetected: If the sync latency exceeds the threshold.
     """
-    if torch.cuda.is_available():
-        torch.cuda.synchronize(device)
+    from .device_compat import gpu_synchronize, is_gpu_available
+
+    if is_gpu_available():
+        gpu_synchronize(device)
     t0 = time.perf_counter()
     user_fn(*args)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize(device)
+    if is_gpu_available():
+        gpu_synchronize(device)
     sync_latency_s = time.perf_counter() - t0
     threshold = multiplier * timed_latency_ms / 1000.0
     if sync_latency_s > threshold:

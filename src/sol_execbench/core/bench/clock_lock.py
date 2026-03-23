@@ -18,10 +18,13 @@
 Clock locking pins the GPU to a fixed frequency, eliminating the 10-30% latency
 variance caused by GPU boost clock fluctuations under thermal pressure.
 
+Supports NVIDIA GPUs via ``nvidia-smi`` and Intel GPUs via the xe driver sysfs
+interface.
+
 Entry points:
 
-- ``probe_clock_lock_available()`` — probes whether ``sudo nvidia-smi`` is
-  available.  Useful for testing and startup diagnostics.
+- ``probe_clock_lock_available()`` — probes whether clock locking is available
+  for the current GPU backend.
 
 - ``lock_clocks(device_name)`` — locks GPU and DRAM clocks.  Called once at
   Docker entrypoint or server startup.
@@ -34,6 +37,7 @@ Entry points:
 
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import subprocess
@@ -47,43 +51,109 @@ logger = logging.getLogger(__name__)
 VERIFY_DELAY_S = 3
 
 
-def probe_clock_lock_available() -> bool:
-    """Probe whether GPU clock locking is available via ``sudo nvidia-smi``.
+# ---------------------------------------------------------------------------
+# Intel GPU sysfs helpers (xe driver)
+# ---------------------------------------------------------------------------
 
-    Runs ``sudo -n nvidia-smi -lgc 1`` and immediately resets the lock.  Returns
-    ``True`` if the command exits with code 0 (passwordless sudo is configured for
-    nvidia-smi), ``False`` otherwise.
+def _find_intel_gpu_freq_dir() -> str | None:
+    """Find the sysfs freq0 directory for the first Intel discrete GPU (xe driver).
+
+    Returns the path to ``.../tile0/gt0/freq0`` or None if not found.
     """
+    # xe driver exposes frequency control at:
+    # /sys/class/drm/cardN/device/tile0/gt0/freq0/{min_freq,max_freq,cur_freq}
+    pattern = "/sys/class/drm/card*/device/tile0/gt0/freq0/cur_freq"
+    matches = sorted(glob.glob(pattern))
+    for match in matches:
+        freq_dir = os.path.dirname(match)
+        # Verify it's an xe device (not i915 integrated)
+        device_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(freq_dir))))
+        driver_link = os.path.join(device_dir, "driver")
+        try:
+            driver_target = os.readlink(driver_link)
+            if "xe" in driver_target:
+                return freq_dir
+        except OSError:
+            continue
+    return None
+
+
+def _read_sysfs(path: str) -> int | None:
+    """Read an integer value from a sysfs file."""
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_sysfs(path: str, value: int) -> bool:
+    """Write an integer value to a sysfs file (requires appropriate permissions)."""
+    try:
+        with open(path, "w") as f:
+            f.write(str(value))
+        return True
+    except OSError as e:
+        logger.warning(f"Failed to write {value} to {path}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def probe_clock_lock_available() -> bool:
+    """Probe whether GPU clock locking is available.
+
+    For NVIDIA: Runs ``sudo -n nvidia-smi -lgc 1`` and immediately resets.
+    For Intel: Checks if xe driver sysfs freq interface is writable.
+
+    Returns ``True`` if clock locking is possible, ``False`` otherwise.
+    """
+    # Try NVIDIA first
     try:
         probe = subprocess.run(
             ["sudo", "-n", "nvidia-smi", "-lgc", "1"],
             capture_output=True,
         )
+        if probe.returncode == 0:
+            subprocess.run(["sudo", "-n", "nvidia-smi", "-rgc"], capture_output=True)
+            return True
     except FileNotFoundError:
-        return False
-    available = probe.returncode == 0
-    if available:
-        subprocess.run(["sudo", "-n", "nvidia-smi", "-rgc"], capture_output=True)
-    return available
+        pass
+
+    # Try Intel xe sysfs
+    freq_dir = _find_intel_gpu_freq_dir()
+    if freq_dir:
+        min_freq_path = os.path.join(freq_dir, "min_freq")
+        return os.access(min_freq_path, os.W_OK)
+
+    return False
 
 
 def lock_clocks(device_name: str) -> bool:
-    """Lock GPU and DRAM clocks for the given device.
+    """Lock GPU clocks for the given device.
 
-    Looks up the device in the preset table, then calls ``sudo nvidia-smi -lgc``
-    and ``sudo nvidia-smi -lmc``.  GPU and DRAM frequencies can be overridden
-    via ``SOL_EXECBENCH_GPU_CLK_MHZ`` and ``SOL_EXECBENCH_DRAM_CLK_MHZ`` env vars.
+    Dispatches to NVIDIA (nvidia-smi) or Intel (xe sysfs) based on the device
+    name.  GPU frequency can be overridden via ``SOL_EXECBENCH_GPU_CLK_MHZ``.
 
     Parameters
     ----------
     device_name : str
-        GPU device name (e.g. from ``nvidia-smi --query-gpu=name``).
+        GPU device name (e.g. ``"NVIDIA B200"`` or ``"Intel(R) Arc(TM) B580"``).
 
     Returns
     -------
     bool
-        True if both GPU and DRAM clocks were locked successfully.
+        True if clocks were locked successfully.
     """
+    if "Intel" in device_name or "Arc" in device_name:
+        return _lock_clocks_intel(device_name)
+    return _lock_clocks_nvidia(device_name)
+
+
+def _lock_clocks_nvidia(device_name: str) -> bool:
+    """Lock clocks on NVIDIA GPU via nvidia-smi."""
     preset = get_clock_preset(device_name)
     gpu_mhz_str = os.environ.get("SOL_EXECBENCH_GPU_CLK_MHZ")
     dram_mhz_str = os.environ.get("SOL_EXECBENCH_DRAM_CLK_MHZ")
@@ -127,11 +197,9 @@ def lock_clocks(device_name: str) -> bool:
         logger.info(f"DRAM clocks locked to {dram_mhz} MHz")
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         logger.warning(f"Failed to lock DRAM clocks: {e}")
-        # Unlock GPU clocks since we couldn't lock DRAM
         subprocess.run(["sudo", "-n", "nvidia-smi", "-rgc"], capture_output=True)
         return False
 
-    # Verify clocks are actually held after a brief stabilization delay
     logger.info(f"Waiting {VERIFY_DELAY_S}s for clocks to stabilize...")
     time.sleep(VERIFY_DELAY_S)
     if not verify_clocks(gpu_mhz, dram_mhz):
@@ -142,13 +210,61 @@ def lock_clocks(device_name: str) -> bool:
     return True
 
 
+def _lock_clocks_intel(device_name: str) -> bool:
+    """Lock clocks on Intel GPU via xe driver sysfs.
+
+    Sets min_freq = max_freq = target frequency to pin the GPU clock.
+    """
+    freq_dir = _find_intel_gpu_freq_dir()
+    if not freq_dir:
+        logger.warning("Intel GPU xe sysfs freq interface not found")
+        return False
+
+    preset = get_clock_preset(device_name)
+    gpu_mhz_str = os.environ.get("SOL_EXECBENCH_GPU_CLK_MHZ")
+    gpu_mhz = (
+        int(gpu_mhz_str) if gpu_mhz_str else (preset.gpu_clk_mhz if preset else None)
+    )
+
+    if gpu_mhz is None:
+        # Default to rp0 (max hardware frequency)
+        rp0 = _read_sysfs(os.path.join(freq_dir, "rp0_freq"))
+        if rp0:
+            gpu_mhz = rp0
+        else:
+            logger.warning(f"No clock preset for '{device_name}' and cannot read rp0_freq")
+            return False
+
+    min_path = os.path.join(freq_dir, "min_freq")
+    max_path = os.path.join(freq_dir, "max_freq")
+
+    # Set max first, then min (to avoid min > max error)
+    if not _write_sysfs(max_path, gpu_mhz):
+        return False
+    if not _write_sysfs(min_path, gpu_mhz):
+        return False
+
+    logger.info(f"Intel GPU clocks locked to {gpu_mhz} MHz via sysfs")
+
+    logger.info(f"Waiting {VERIFY_DELAY_S}s for clocks to stabilize...")
+    time.sleep(VERIFY_DELAY_S)
+
+    cur = _read_sysfs(os.path.join(freq_dir, "cur_freq"))
+    if cur is not None and abs(cur - gpu_mhz) > 100:
+        logger.warning(
+            f"Intel GPU clock verification failed — expected {gpu_mhz} MHz, got {cur} MHz"
+        )
+        _unlock_clocks_intel()
+        return False
+
+    logger.info(f"Intel GPU clock verified: cur_freq = {cur} MHz")
+    return True
+
+
 def verify_clocks(
     expected_gpu_mhz: int, expected_dram_mhz: int, tolerance_mhz: int = 50
 ) -> bool:
     """Verify current GPU/DRAM clocks match expected frequencies via nvidia-smi.
-
-    Queries all GPUs and checks that current frequencies are within *tolerance_mhz*
-    of the expected values.
 
     Parameters
     ----------
@@ -218,17 +334,36 @@ def verify_clocks(
 
 def unlock_clocks() -> None:
     """Reset GPU and DRAM clocks.  Best-effort — errors are logged but not raised."""
+    # NVIDIA
     try:
         subprocess.run(["sudo", "-n", "nvidia-smi", "-rgc"], capture_output=True)
-        logger.info("GPU clocks unlocked")
+        logger.info("NVIDIA GPU clocks unlocked")
     except Exception as e:
-        logger.warning(f"Failed to unlock GPU clocks: {e}")
+        logger.debug(f"nvidia-smi -rgc failed (expected on non-NVIDIA): {e}")
 
     try:
         subprocess.run(["sudo", "-n", "nvidia-smi", "-rmc"], capture_output=True)
-        logger.info("DRAM clocks unlocked")
+        logger.info("NVIDIA DRAM clocks unlocked")
     except Exception as e:
-        logger.warning(f"Failed to unlock DRAM clocks: {e}")
+        logger.debug(f"nvidia-smi -rmc failed (expected on non-NVIDIA): {e}")
+
+    # Intel
+    _unlock_clocks_intel()
+
+
+def _unlock_clocks_intel() -> None:
+    """Reset Intel GPU clocks to hardware defaults via xe sysfs."""
+    freq_dir = _find_intel_gpu_freq_dir()
+    if not freq_dir:
+        return
+
+    rpn = _read_sysfs(os.path.join(freq_dir, "rpn_freq"))  # min hardware freq
+    rp0 = _read_sysfs(os.path.join(freq_dir, "rp0_freq"))  # max hardware freq
+    if rpn is not None:
+        _write_sysfs(os.path.join(freq_dir, "min_freq"), rpn)
+    if rp0 is not None:
+        _write_sysfs(os.path.join(freq_dir, "max_freq"), rp0)
+    logger.info("Intel GPU clocks reset to defaults")
 
 
 def are_clocks_locked() -> bool:

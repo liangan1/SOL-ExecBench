@@ -46,7 +46,14 @@ _CPP_LANGUAGES = {
     SupportedLanguages.CUBLAS,
 }
 
+_SYCL_LANGUAGES = {
+    SupportedLanguages.SYCL_CPP,
+}
+
+_COMPILED_LANGUAGES = _CPP_LANGUAGES | _SYCL_LANGUAGES
+
 _BLACKWELL_HARDWARE = {SupportedHardware.B200}
+_BMG_HARDWARE = {SupportedHardware.BMG}
 
 
 def _get_local_sm() -> str | None:
@@ -117,6 +124,14 @@ class ProblemPackager:
     def _is_cpp(self) -> bool:
         return any(lang in _CPP_LANGUAGES for lang in self.solution.spec.languages)
 
+    @property
+    def _is_sycl(self) -> bool:
+        return any(lang in _SYCL_LANGUAGES for lang in self.solution.spec.languages)
+
+    @property
+    def _needs_compile(self) -> bool:
+        return any(lang in _COMPILED_LANGUAGES for lang in self.solution.spec.languages)
+
     def _inject_gencode_flags(self, sol_dict: dict) -> dict:
         """Auto-inject -gencode flags when no explicit arch flag is set.
 
@@ -163,25 +178,33 @@ class ProblemPackager:
     def compile(self) -> tuple[list[str], str]:
         """Stage compilation files and return (command, artifact_path).
 
-        Writes build_ext.py, solution.json, and C++/CUDA source files to
-        output_dir. Injects gencode flags for the target hardware.
+        Writes the appropriate build script, solution.json, and source files
+        to output_dir.  For CUDA, injects gencode flags for the target hardware.
+        For SYCL, uses the SYCL build template with icpx.
 
         The CLI should run the command in output_dir.
         After success, the artifact (benchmark_kernel.so) will be at artifact_path.
         """
-        assert self._is_cpp, (
-            f"compile() only handles C++/CUDA solutions, "
+        assert self._needs_compile, (
+            f"compile() only handles compiled solutions, "
             f"got languages={self.solution.spec.languages}"
         )
 
         sol_dict = json.loads(self.solution.model_dump_json())
-        sol_dict = self._inject_gencode_flags(sol_dict)
 
-        # Overwrite solution.json with injected gencode flags.
-        (self.output_dir / "solution.json").write_text(json.dumps(sol_dict))
-        (self.output_dir / "build_ext.py").write_text(
-            (_TEMPLATES_DIR / "build_ext.py").read_text()
-        )
+        if self._is_sycl:
+            # SYCL compilation — no gencode injection needed
+            (self.output_dir / "solution.json").write_text(json.dumps(sol_dict))
+            (self.output_dir / "build_ext.py").write_text(
+                (_TEMPLATES_DIR / "build_ext_sycl.py").read_text()
+            )
+        else:
+            # CUDA compilation — inject gencode flags
+            sol_dict = self._inject_gencode_flags(sol_dict)
+            (self.output_dir / "solution.json").write_text(json.dumps(sol_dict))
+            (self.output_dir / "build_ext.py").write_text(
+                (_TEMPLATES_DIR / "build_ext.py").read_text()
+            )
 
         cmd = ["python", "build_ext.py"]
         artifact_path = str(self.output_dir / "benchmark_kernel.so")
@@ -199,12 +222,12 @@ class ProblemPackager:
         The CLI should run the command in output_dir.
         Trace JSON will be emitted on stdout (one JSON object per line).
         """
-        if self._is_cpp:
+        if self._needs_compile:
             so_path = self.output_dir / "benchmark_kernel.so"
             if not so_path.exists():
                 raise FileNotFoundError(
                     f"benchmark_kernel.so not found at {so_path} — "
-                    "run compile() first for C++/CUDA solutions"
+                    "run compile() first for compiled solutions"
                 )
 
         (self.output_dir / "eval_driver.py").write_text(

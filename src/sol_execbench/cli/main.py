@@ -297,14 +297,14 @@ def cli(
     if verbose:
         console.print(f"[dim]Staging dir: {staging_dir}[/dim]")
 
-    # Phase 1: Compile (C++/CUDA only)
-    if packager._is_cpp:
+    # Phase 1: Compile (C++/CUDA/SYCL)
+    if packager._needs_compile:
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("Compiling C++/CUDA solution...", total=None)
+            task = progress.add_task("Compiling solution...", total=None)
 
             cmd, artifact_path = packager.compile()
             proc = subprocess.run(

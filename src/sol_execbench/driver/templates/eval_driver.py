@@ -69,13 +69,11 @@ def _call_and_collect_outputs(
     if dps:
         outputs = allocate_outputs(definition, resolved_axes, device)
         fn(*inputs, *outputs)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(device)
+        gpu_synchronize(device)
         return outputs
     else:
         result = fn(*inputs)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize(device)
+        gpu_synchronize(device)
         out_dict = normalize_outputs(
             result,
             device=torch.device(device),
@@ -115,6 +113,12 @@ from sol_execbench.core.bench.config import BenchmarkConfig  # noqa: E402
 from sol_execbench.core.bench.correctness import (  # noqa: E402
     compute_error_stats,
     set_seed,
+)
+from sol_execbench.core.bench.device_compat import (  # noqa: E402
+    detect_device,
+    get_device_name,
+    get_oom_errors,
+    gpu_synchronize,
 )
 from sol_execbench.core.bench.io import (  # noqa: E402
     ShiftingMemoryPoolAllocator,
@@ -211,13 +215,14 @@ if "::" in _entry_point:
 else:
     _entry_module_or_file, _entry_func_name = _entry_point, "run"
 
-_CPP_LANGUAGES = {
+_COMPILED_LANGUAGES = {
     SupportedLanguages.CUDA_CPP,
     SupportedLanguages.CUTLASS,
     SupportedLanguages.CUDNN,
     SupportedLanguages.CUBLAS,
+    SupportedLanguages.SYCL_CPP,
 }
-if any(lang in _CPP_LANGUAGES for lang in _solution.spec.languages):
+if any(lang in _COMPILED_LANGUAGES for lang in _solution.spec.languages):
     _so_path = STAGING_DIR / "benchmark_kernel.so"
     if not _so_path.exists():
         raise RuntimeError(f"benchmark_kernel.so not found at {_so_path}")
@@ -249,7 +254,7 @@ else:
     user_fn = getattr(_user_mod, _entry_func_name)
 
 # ── Device ────────────────────────────────────────────────────────────────────
-_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+_device = detect_device()
 
 # ── Safetensors blob roots ────────────────────────────────────────────────────
 # Priority: 1) staging dir (client-inlined blobs), 2) flashinfer-trace directory.
@@ -304,7 +309,7 @@ _output_dtypes_torch = {
 
 
 # ── Evaluate each workload ────────────────────────────────────────────────────
-_device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+_device_name = get_device_name(_device)
 
 # Check whether clocks are locked (set by Docker entrypoint / server startup).
 _clocks_locked = are_clocks_locked()
@@ -584,7 +589,7 @@ for _workload in workloads:
         _allocator = ShiftingMemoryPoolAllocator(
             _inputs, _timing_outputs, _total_timing_iters
         )
-    except torch.cuda.OutOfMemoryError as _e:
+    except get_oom_errors() as _e:
         _emit(
             Trace(
                 definition=definition.name,

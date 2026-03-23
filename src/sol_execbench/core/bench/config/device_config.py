@@ -33,6 +33,7 @@ CLOCK_LOCK_PRESETS: dict[str, ClockPreset] = {
     "NVIDIA B200": ClockPreset(gpu_clk_mhz=1500, dram_clk_mhz=3996),
     "NVIDIA H100": ClockPreset(gpu_clk_mhz=1410, dram_clk_mhz=1593),
     "NVIDIA A100": ClockPreset(gpu_clk_mhz=1065, dram_clk_mhz=1215),
+    "Intel(R) Arc(TM) B580": ClockPreset(gpu_clk_mhz=2850, dram_clk_mhz=2500),
 }
 
 

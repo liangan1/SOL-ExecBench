@@ -53,6 +53,8 @@ class SupportedLanguages(str, Enum):
     """NVIDIA cuBLAS programming language."""
     CUDA_CPP = "cuda_cpp"
     """CUDA C++ programming language with inline PTX support."""
+    SYCL_CPP = "sycl_cpp"
+    """SYCL C++ programming language for Intel GPU (DPC++)."""
 
 
 class SupportedHardware(str, Enum):
@@ -63,8 +65,10 @@ class SupportedHardware(str, Enum):
 
     B200 = "B200"
     """NVIDIA B200."""
+    BMG = "BMG"
+    """Intel Arc B-Series (Battlemage)."""
     LOCAL = "LOCAL"
-    """Local NVIDIA GPU."""
+    """Local GPU (auto-detect)."""
 
 
 class SupportedBindings(str, Enum):
@@ -137,7 +141,7 @@ class SourceFile(BaseModelWithDocstrings):
                     f"Source file '{self.path}' contains the forbidden keyword 'stream'. "
                     "CUDA stream usage is not permitted in Python solutions."
                 )
-        elif suffix in (".cu", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".cuh"):
+        elif suffix in (".cu", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".cuh", ".sycl"):
             # Allow getCurrentCUDAStream (returns the default stream the
             # benchmark already runs on).  Block APIs that create or
             # switch streams — these enable stream-injection timing attacks.
@@ -147,7 +151,9 @@ class SourceFile(BaseModelWithDocstrings):
                 r"|cudaStreamWaitEvent|cudaStreamDestroy"
                 r"|cuStreamCreate|CUstream"
                 r"|c10::cuda::CUDAStream"
-                r"|at::cuda::getStreamFromPool",
+                r"|at::cuda::getStreamFromPool"
+                r"|sycl::queue\s*[({]"
+                r"|sycl::queue\s+\w",
                 re.IGNORECASE,
             )
             match = _FORBIDDEN_STREAM_APIS.search(self.content)
@@ -167,9 +173,11 @@ class CompileOptions(BaseModelWithDocstrings):
     """
 
     cflags: list[str] = Field(default_factory=list)
-    """Extra flags passed to the C++ compiler (gcc/g++)."""
+    """Extra flags passed to the C++ compiler (gcc/g++/icpx)."""
     cuda_cflags: list[str] = Field(default_factory=list)
     """Extra flags passed to the CUDA compiler (nvcc)."""
+    sycl_cflags: list[str] = Field(default_factory=list)
+    """Extra flags passed to the SYCL compiler (icpx -fsycl)."""
     ld_flags: list[str] = Field(default_factory=list)
     """Extra flags passed to the linker."""
 

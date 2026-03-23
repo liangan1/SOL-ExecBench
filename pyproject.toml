@@ -7,19 +7,12 @@ name = "sol-execbench"
 version = "1.0.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.10.0",
-    "torchvision>=0.24.1",
-    "ninja>=1.13.0",
-    "cuda-tile==1.1.0",
-    "nvidia-cudnn-frontend==1.18.0",
-    "nvidia-cutlass-dsl[cu13]==4.4.1",
     "pydantic>=2.12.5",
     "safetensors>=0.7.0",
     "click>=8.0",
     "rich>=13.0",
-    "datasets>=4.8.2",
 ]
 
 [project.scripts]

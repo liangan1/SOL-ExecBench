@@ -1,0 +1,89 @@
+#include <torch/extension.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <c10/xpu/XPUStream.h>
+
+using bf16 = sycl::ext::oneapi::bfloat16;
+
+constexpr int HIDDEN_SIZE = 4096;
+constexpr float EPS = 1e-5f;
+constexpr int WG_SIZE = 256;
+
+class RMSNormKernel;  // named kernel type
+
+// Each work-group processes one row of the input (hidden_size elements).
+// Reduction over hidden_size is done using SLM (shared local memory).
+void rmsnorm_kernel(sycl::nd_item<1> item,
+                    const bf16 *__restrict__ input,
+                    const bf16 *__restrict__ weight,
+                    bf16 *__restrict__ output,
+                    float *__restrict__ slm) {
+    const int row = item.get_group(0);
+    const int lid = item.get_local_id(0);
+    const int wg_size = item.get_local_range(0);
+
+    const bf16 *row_in = input + row * HIDDEN_SIZE;
+    bf16 *row_out = output + row * HIDDEN_SIZE;
+
+    // Phase 1: compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = lid; i < HIDDEN_SIZE; i += wg_size) {
+        float val = static_cast<float>(row_in[i]);
+        sum_sq += val * val;
+    }
+
+    // Reduction in SLM
+    slm[lid] = sum_sq;
+    item.barrier(sycl::access::fence_space::local_space);
+
+    for (int stride = wg_size / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            slm[lid] += slm[lid + stride];
+        }
+        item.barrier(sycl::access::fence_space::local_space);
+    }
+
+    float inv_rms = sycl::rsqrt(slm[0] / static_cast<float>(HIDDEN_SIZE) + EPS);
+
+    // Phase 2: normalize and scale
+    for (int i = lid; i < HIDDEN_SIZE; i += wg_size) {
+        float val = static_cast<float>(row_in[i]);
+        float w = static_cast<float>(weight[i]);
+        row_out[i] = bf16(val * inv_rms * w);
+    }
+}
+
+torch::Tensor run(torch::Tensor hidden_states, torch::Tensor weight) {
+    TORCH_CHECK(hidden_states.dim() == 2, "hidden_states must be 2D");
+    TORCH_CHECK(hidden_states.size(1) == HIDDEN_SIZE, "hidden_size must be 4096");
+    TORCH_CHECK(hidden_states.is_xpu(), "hidden_states must be on XPU");
+    TORCH_CHECK(hidden_states.scalar_type() == at::kBFloat16, "hidden_states must be bfloat16");
+
+    const int batch_size = hidden_states.size(0);
+    auto output = torch::empty_like(hidden_states);
+
+    auto &queue = c10::xpu::getCurrentXPUStream().queue();
+
+    const bf16 *in_ptr =
+        reinterpret_cast<const bf16 *>(hidden_states.data_ptr<at::BFloat16>());
+    const bf16 *w_ptr =
+        reinterpret_cast<const bf16 *>(weight.data_ptr<at::BFloat16>());
+    bf16 *out_ptr =
+        reinterpret_cast<bf16 *>(output.data_ptr<at::BFloat16>());
+
+    queue.submit([&](sycl::handler &cgh) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(WG_SIZE), cgh);
+        cgh.parallel_for<RMSNormKernel>(
+            sycl::nd_range<1>(batch_size * WG_SIZE, WG_SIZE),
+            [=](sycl::nd_item<1> item) {
+                rmsnorm_kernel(item, in_ptr, w_ptr, out_ptr,
+                               slm.get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+    });
+
+    return output;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("run", &run, "SYCL RMSNorm kernel");
+}

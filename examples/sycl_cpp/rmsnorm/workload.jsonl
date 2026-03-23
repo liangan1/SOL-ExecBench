@@ -1,0 +1,3 @@
+{"axes": {"batch_size": 128}, "inputs": {"hidden_states": {"type": "random"}, "weight": {"type": "random"}}, "uuid": "sycl-rmsnorm-128"}
+{"axes": {"batch_size": 512}, "inputs": {"hidden_states": {"type": "random"}, "weight": {"type": "random"}}, "uuid": "sycl-rmsnorm-512"}
+{"axes": {"batch_size": 2048}, "inputs": {"hidden_states": {"type": "random"}, "weight": {"type": "random"}}, "uuid": "sycl-rmsnorm-2048"}
